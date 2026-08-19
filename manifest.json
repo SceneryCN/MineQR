@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "网盘二维码解析 - 一键直链",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "解析 gamers520.com 页面上的网盘二维码，自动提取链接并展示为可点击访问的直链（含提取码）。",
   "minimum_chrome_version": "88",
   "icons": {
@@ -11,7 +11,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://gamers520.com/*", "*://*.gamers520.com/*"],
+      "matches": ["*://gamers520.com/*.html*", "*://*.gamers520.com/*.html*"],
       "js": ["vendor/jsQR.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"

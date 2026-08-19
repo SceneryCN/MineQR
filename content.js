@@ -37,10 +37,23 @@
 
   const MAX_DECODE_SIDE_PX = 640;
   const COPY_FEEDBACK_DURATION_MS = 1800;
-  const SCAN_DEBOUNCE_MS = 300;
+  const IDLE_PROCESSING_TIMEOUT_MS = 500;
+  const QR_CANDIDATE_SELECTOR = [
+    "img[src*='qr' i]",
+    "img[data-src*='qr' i]",
+    "img[alt*='二维码']",
+    "img[alt*='扫码']",
+    "img[alt*='qrcode' i]",
+    "img[alt*='qr code' i]",
+    "[class*='qr' i] img",
+  ].join(",");
+  const pendingImages = new Set();
+  let processingScheduled = false;
 
   /** Determines whether an image is likely to contain a QR code. */
   function looksLikeQr(img) {
+    if (img.classList.contains("qrto-action-icon")) return false;
+
     const src = (img.getAttribute("src") || "") + (img.getAttribute("data-src") || "");
     const alt = img.getAttribute("alt") || "";
     if (/qr(code|server)?/i.test(src)) return true;
@@ -70,7 +83,7 @@
   }
 
   /** Finds download metadata without leaking into neighbouring cards. */
-  function extractFromDomContext(img) {
+  function extractFromDomContext(img, includeUrls) {
     const results = { urls: [], pwd: null };
     const alt = img.getAttribute("alt") || "";
     const title = img.getAttribute("title") || "";
@@ -91,24 +104,56 @@
     const p2 = text.match(/pwd[:=]\s*([A-Za-z0-9]{4,8})/i);
     if (p1 || p2) results.pwd = (p1 || p2)[1];
 
-    scope.querySelectorAll("a[href]").forEach((anchor) => {
-      const href = anchor.href;
-      if (
-        /^https?:/.test(href) &&
-        /pan\.|gofile|quark|xunlei|drive|cloud|disk|123pan|lanzou/i.test(href) &&
-        !results.urls.includes(href)
-      ) {
-        results.urls.push(href);
-      }
-    });
+    if (includeUrls) {
+      scope.querySelectorAll("a[href]").forEach((anchor) => {
+        const href = anchor.href;
+        if (
+          /^https?:/.test(href) &&
+          /pan\.|gofile|quark|xunlei|drive|cloud|disk|123pan|lanzou/i.test(href) &&
+          !results.urls.includes(href)
+        ) {
+          results.urls.push(href);
+        }
+      });
 
-    const textUrls = text.match(/https?:\/\/[^\s"'<>]+/g) || [];
-    textUrls.forEach((url) => {
-      const cleanUrl = url.replace(/[.。,，]$/, "");
-      if (!results.urls.includes(cleanUrl)) results.urls.push(cleanUrl);
-    });
+      const textUrls = text.match(/https?:\/\/[^\s"'<>]+/g) || [];
+      textUrls.forEach((url) => {
+        const cleanUrl = url.replace(/[.。,，]$/, "");
+        if (!results.urls.includes(cleanUrl)) results.urls.push(cleanUrl);
+      });
+    }
 
     return results;
+  }
+
+  function decodeLoadedImage(image) {
+    const sourceWidth = image.naturalWidth || image.width;
+    const sourceHeight = image.naturalHeight || image.height;
+    if (!sourceWidth || !sourceHeight || typeof window.jsQR !== "function") return null;
+
+    const scale = Math.min(
+      1,
+      MAX_DECODE_SIDE_PX / Math.max(sourceWidth, sourceHeight)
+    );
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+    canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+
+    try {
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) return null;
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+      const code = window.jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: "dontInvert",
+      });
+      return code ? code.data : null;
+    } catch (error) {
+      return null;
+    } finally {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
   }
 
   /** Decodes QR pixels locally with jsQR. */
@@ -120,46 +165,12 @@
 
         const image = new Image();
         image.crossOrigin = "anonymous";
-        image.onload = () => {
-          try {
-            const scale = Math.min(
-              1,
-              MAX_DECODE_SIDE_PX / Math.max(image.width, image.height)
-            );
-            const canvas = document.createElement("canvas");
-            canvas.width = Math.max(1, Math.round(image.width * scale));
-            canvas.height = Math.max(1, Math.round(image.height * scale));
-            const ctx = canvas.getContext("2d");
-            ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const code = window.jsQR(imageData.data, imageData.width, imageData.height, {
-              inversionAttempts: "dontInvert",
-            });
-            resolve(code ? code.data : null);
-          } catch (e) {
-            resolve(null);
-          }
-        };
+        image.onload = () => resolve(decodeLoadedImage(image));
         image.onerror = () => {
           // Retry without CORS mode for same-origin or browser-cached images.
           if (image.crossOrigin !== undefined) {
             const img2 = new Image();
-            img2.onload = () => {
-              try {
-                const canvas = document.createElement("canvas");
-                canvas.width = img2.naturalWidth || 150;
-                canvas.height = img2.naturalHeight || 150;
-                const ctx = canvas.getContext("2d");
-                ctx.drawImage(img2, 0, 0);
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const code = window.jsQR(imageData.data, imageData.width, imageData.height, {
-                  inversionAttempts: "dontInvert",
-                });
-                resolve(code ? code.data : null);
-              } catch (e2) {
-                resolve(null);
-              }
-            };
+            img2.onload = () => resolve(decodeLoadedImage(img2));
             img2.onerror = () => resolve(null);
             img2.src = src;
           } else {
@@ -194,7 +205,7 @@
 
     let urls = extractFromQrServerSrc(src);
 
-    const ctx = extractFromDomContext(img);
+    const ctx = extractFromDomContext(img, !urls || !urls.length);
 
     if (!urls || !urls.length) {
       const decoded = await decodeImage(img);
@@ -228,6 +239,8 @@
         return false;
       }
     });
+
+    if (processedSources.get(img) !== src) return;
 
     if (unique.length) {
       injectLinkPanel(img, unique, pwd);
@@ -296,23 +309,10 @@
       const copyButton = document.createElement("button");
       copyButton.className = "qrto-copy-button";
       copyButton.type = "button";
+      copyButton.dataset.qrtoCopyCode = pwd;
       copyButton.setAttribute("aria-label", `${UI_TEXT.copyCode} ${pwd}`);
       copyButton.innerHTML =
         `<span>${UI_TEXT.copyCode}</span><strong>${pwd}</strong><span class="qrto-copy-status" aria-live="polite"></span>`;
-      copyButton.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(pwd);
-          const status = copyButton.querySelector(".qrto-copy-status");
-          status.textContent = UI_TEXT.copied;
-          copyButton.classList.add("is-copied");
-          window.setTimeout(() => {
-            status.textContent = "";
-            copyButton.classList.remove("is-copied");
-          }, COPY_FEEDBACK_DURATION_MS);
-        } catch (error) {
-          return;
-        }
-      });
       panel.appendChild(copyButton);
     }
 
@@ -328,35 +328,94 @@
     }
   }
 
-  /** Scans the current document for QR images. */
-  function scan() {
-    const imgs = Array.from(document.querySelectorAll("img"));
-    imgs.forEach((img) => {
-      if (!looksLikeQr(img)) return;
+  function processPendingImages() {
+    processingScheduled = false;
+    const images = Array.from(pendingImages);
+    pendingImages.clear();
+
+    images.forEach((img) => {
+      if (!img.isConnected || !looksLikeQr(img)) return;
       const src = img.currentSrc || img.src || img.getAttribute("data-src") || "";
-      if (processedSources.get(img) === src) return;
-      enhanceImage(img);
+      if (processedSources.get(img) !== src) enhanceImage(img);
     });
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", scan);
-  } else {
-    scan();
+  function scheduleProcessing() {
+    if (processingScheduled) return;
+    processingScheduled = true;
+
+    if ("requestIdleCallback" in window) {
+      window.requestIdleCallback(processPendingImages, {
+        timeout: IDLE_PROCESSING_TIMEOUT_MS,
+      });
+      return;
+    }
+
+    window.setTimeout(processPendingImages, 0);
   }
 
-  // Observe lazy-loaded and asynchronously inserted content.
-  let timer = null;
-  const observer = new MutationObserver(() => {
-    clearTimeout(timer);
-    timer = setTimeout(scan, SCAN_DEBOUNCE_MS);
+  function enqueueImage(img) {
+    pendingImages.add(img);
+    scheduleProcessing();
+  }
+
+  function collectImages(node) {
+    if (!(node instanceof Element)) return;
+    if (node.tagName === "IMG") enqueueImage(node);
+    node.querySelectorAll(QR_CANDIDATE_SELECTOR).forEach(enqueueImage);
+  }
+
+  function scanInitialImages() {
+    document.querySelectorAll(QR_CANDIDATE_SELECTOR).forEach(enqueueImage);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", scanInitialImages, { once: true });
+  } else {
+    scanInitialImages();
+  }
+
+  // Only inspect new or source-updated images instead of rescanning the document.
+  const observer = new MutationObserver((mutations) => {
+    mutations.forEach((mutation) => {
+      if (mutation.type === "attributes") {
+        if (mutation.target.tagName === "IMG") enqueueImage(mutation.target);
+        return;
+      }
+      mutation.addedNodes.forEach(collectImages);
+    });
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["src", "data-src"],
+  });
 
   document.addEventListener("lazybeforeunveil", (e) => {
     const img = e.target;
-    if (img && img.tagName === "IMG" && looksLikeQr(img)) {
-      enhanceImage(img);
+    if (img && img.tagName === "IMG") enqueueImage(img);
+  });
+
+  document.addEventListener("click", async (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+
+    const copyButton = target.closest("[data-qrto-copy-code]");
+    if (!copyButton) return;
+
+    try {
+      await navigator.clipboard.writeText(copyButton.dataset.qrtoCopyCode);
+      const status = copyButton.querySelector(".qrto-copy-status");
+      if (!status) return;
+      status.textContent = UI_TEXT.copied;
+      copyButton.classList.add("is-copied");
+      window.setTimeout(() => {
+        status.textContent = "";
+        copyButton.classList.remove("is-copied");
+      }, COPY_FEEDBACK_DURATION_MS);
+    } catch (error) {
+      return;
     }
   });
 })();
