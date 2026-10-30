@@ -109,6 +109,14 @@
   color: #c7d9bd;
 }
 
+.qrto-copy-button.is-failed {
+  border-color: #7a3b2e;
+}
+
+.qrto-copy-button.is-failed .qrto-copy-status {
+  color: #f0b4a4;
+}
+
 .qrto-original-pwd-hidden {
   display: none !important;
 }
